@@ -9,18 +9,19 @@ type SaveJobData = {
   createdBy: User;
 };
 
-export async function findLatestUser() {
-  const usersRepository = AppDataSource.getRepository(User);
+// Более не нужно т.к. ищется реальный юзер
+// export async function findLatestUser() {
+//   const usersRepository = AppDataSource.getRepository(User);
 
-  const [user] = await usersRepository.find({
-    take: 1,
-    order: {
-      id: "DESC",
-    },
-  });
+//   const [user] = await usersRepository.find({
+//     take: 1,
+//     order: {
+//       id: "DESC",
+//     },
+//   });
 
-  return user;
-}
+//   return user;
+// }
 
 export async function saveJob(data: SaveJobData) {
   const jobsRepository = AppDataSource.getRepository(Job);

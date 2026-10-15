@@ -3,9 +3,26 @@ import { QueryFailedError } from "typeorm";
 
 import { AppError } from "../errors/app-error.js";
 
+function isCsrfError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "EBADCSRFTOKEN"
+  );
+}
+
 export const errorHandler: ErrorRequestHandler = (error, _req, res, next) => {
   if (res.headersSent) {
     next(error);
+    return;
+  }
+
+  if (isCsrfError(error)) {
+    res.status(403).json({
+      success: false,
+      message: "Некорректный CSRF-токен",
+    });
     return;
   }
 

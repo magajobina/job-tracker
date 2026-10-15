@@ -1,5 +1,6 @@
+import { findUserById } from "../auth/auth.repository.js";
 import { AppError } from "../errors/app-error.js";
-import { findLatestUser, saveJob } from "./jobs.repository.js";
+import { saveJob } from "./jobs.repository.js";
 
 export type CreateJobInput = {
   title: string;
@@ -7,11 +8,11 @@ export type CreateJobInput = {
   salary?: number | null;
 };
 
-export async function createJob(input: CreateJobInput) {
-  const user = await findLatestUser();
+export async function createJob(input: CreateJobInput, userId: string) {
+  const user = await findUserById(userId);
 
   if (!user) {
-    throw new AppError(404, "Пользователь не найден");
+    throw new AppError(401, "Необходима авторизация");
   }
 
   const savedJob = await saveJob({
