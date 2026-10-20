@@ -1,6 +1,7 @@
 import { findUserById } from "../auth/auth.repository.js";
 import { AppError } from "../errors/app-error.js";
 import { saveJob } from "./jobs.repository.js";
+import { invalidateJobsCache } from "./jobs.cache.js";
 
 export type CreateJobInput = {
   title: string;
@@ -21,6 +22,8 @@ export async function createJob(input: CreateJobInput, userId: string) {
     salary: input.salary ?? null,
     createdBy: user,
   });
+
+  await invalidateJobsCache();
 
   return {
     id: savedJob.id,

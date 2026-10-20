@@ -10,6 +10,7 @@ import { createJobController } from "./jobs/jobs.controller.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { AppError } from "./errors/app-error.js";
 import { sessionMiddleware } from "./middleware/session.js";
+import { connectRedis, redisClient } from "./redis.js";
 import {
   csrfSynchronisedProtection,
   generateToken,
@@ -27,8 +28,22 @@ import {
   APPLICATION_STATUSES,
 } from "./entities/application.entity.js";
 import { loginRateLimiter } from "./middleware/login-rate-limiter.js";
+import {
+  createJobsCacheKey,
+  readJobsCache,
+  writeJobsCache,
+  invalidateJobsCache,
+} from "./jobs/jobs.cache.js";
+import {
+  createExportController,
+  downloadExportController,
+  getExportStatusController,
+} from "./exports/export.controller.js";
+import { exportQueue } from "./exports/export.queue.js";
+import { requeueInterruptedExports } from "./exports/export.repository.js";
 
 await AppDataSource.initialize();
+await connectRedis();
 const jobsRepository = AppDataSource.getRepository(Job);
 const usersRepository = AppDataSource.getRepository(User);
 const applicationsRepository = AppDataSource.getRepository(Application);
@@ -74,6 +89,10 @@ app.post("/auth/register", registerController);
 app.post("/auth/login", loginRateLimiter, loginController);
 app.get("/auth/me", authMeController);
 app.post("/auth/logout", logoutController);
+
+app.post("/exports", requireAuth, createExportController);
+app.get("/exports/:id/file", requireAuth, downloadExportController);
+app.get("/exports/:id", requireAuth, getExportStatusController);
 
 app.get("/applications", requireAuth, async (req, res) => {
   const parsedQuery = ApplicationsQuerySchema.safeParse(req.query);
@@ -309,6 +328,8 @@ app.delete("/jobs/:id", requireAuth, async (req, res) => {
     throw new AppError(404, "Вакансия не найдена");
   }
 
+  await invalidateJobsCache();
+
   res.status(204).end();
 });
 
@@ -374,6 +395,8 @@ app.patch("/jobs/:id", requireAuth, async (req, res) => {
 
   const savedJob = await jobsRepository.save(mergedJob);
 
+  await invalidateJobsCache();
+
   res.status(200).json({
     job: {
       id: savedJob.id,
@@ -396,6 +419,14 @@ app.get("/jobs", async (req, res) => {
   const sort = req.query.sort ?? "created_at_desc";
   let sortOrder: "DESC" | "ASC" = "DESC";
   const where: FindOptionsWhere<Job> = {};
+
+  const company =
+    typeof req.query.company === "string"
+      ? req.query.company.trim().toLowerCase()
+      : "";
+
+  const q =
+    typeof req.query.q === "string" ? req.query.q.trim().toLowerCase() : "";
 
   if (!Number.isInteger(page) || page <= 0) {
     res.status(400).json({
@@ -421,12 +452,12 @@ app.get("/jobs", async (req, res) => {
 
   const skip = (page - 1) * limit;
 
-  if (req.query.company && typeof req.query.company === "string") {
-    where.company = ILike(req.query.company.trim());
+  if (company) {
+    where.company = ILike(company);
   }
 
-  if (req.query.q && typeof req.query.q === "string") {
-    where.title = ILike(`%${req.query.q.trim()}%`);
+  if (q) {
+    where.title = ILike(`%${q}%`);
   }
 
   if (
@@ -440,6 +471,36 @@ app.get("/jobs", async (req, res) => {
   }
 
   sortOrder = sort === "created_at_asc" ? "ASC" : "DESC";
+
+  // КЕШ РЕДИСА НАЧАЛО------
+  let cacheKey: string | null = null;
+
+  try {
+    cacheKey = await createJobsCacheKey({
+      page,
+      limit,
+      q,
+      company,
+      sort,
+    });
+
+    const cachedResponse = await readJobsCache(cacheKey);
+
+    if (cachedResponse !== null) {
+      console.log("cache_hit");
+
+      res.json(JSON.parse(cachedResponse));
+      return;
+    }
+
+    console.log("cache_miss");
+  } catch (error) {
+    console.error("Jobs cache unavailable:", error);
+
+    // Продолжаем выполнение и читаем PostgreSQL.
+    cacheKey = null;
+  }
+  // КЕШ РЕДИСА КОНЕЦ------
 
   const [items, total] = await jobsRepository.findAndCount({
     take: limit,
@@ -458,12 +519,24 @@ app.get("/jobs", async (req, res) => {
     createdAt: job.createdAt,
   }));
 
-  res.json({
+  const response = {
     items: publicItems,
     total,
     page,
     limit,
-  });
+  };
+
+  // КЕШ РЕДИСА НАЧАЛО----
+  if (cacheKey !== null) {
+    try {
+      await writeJobsCache(cacheKey, response);
+    } catch (error) {
+      console.error("Не удалось записать jobs cache:", error);
+    }
+  }
+  // КЕШ РЕДИСА КОНЕЦ----
+
+  res.json(response);
 });
 
 // app.get("/make-some-job", async (_req, res) => {
@@ -550,7 +623,45 @@ const server = app.listen(port, () => {
   console.log(`API started on http://localhost:${port}`);
 });
 
-process.on("SIGTERM", async () => {
-  server.close();
-  await db.end();
-});
+let isShuttingDown = false;
+
+function closeHttpServer() {
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+async function shutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  console.log(`Получен ${signal}. Завершаем работу...`);
+
+  try {
+    await closeHttpServer();
+
+    await exportQueue.close();
+
+    if (redisClient.isOpen) {
+      await redisClient.quit();
+    }
+
+    if (AppDataSource.isInitialized) {
+      await AppDataSource.destroy();
+    }
+
+    await db.end();
+
+    console.log("Приложение корректно остановлено");
+    process.exit(0);
+  } catch (error) {
+    console.error("Ошибка при остановке приложения:", error);
+    process.exit(1);
+  }
+}
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
