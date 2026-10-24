@@ -20,6 +20,7 @@ import {
   markExportQueuedForRetry,
   requeueInterruptedExports,
 } from "../exports/export.repository.js";
+import { getExportFileLocation, getTemporaryExportPath } from "../exports/export-files.js";
 
 function toCsvCell(value: unknown) {
   let text = String(value ?? "");
@@ -82,12 +83,10 @@ const worker = new Worker<ExportJobData>(
       return;
     }
 
-    const finalPath = resolve(exportsDirectory, `applications-${exportId}.csv`);
+    const { fileKey, absolutePath: finalPath } =
+      getExportFileLocation(exportId);
 
-    const temporaryPath = resolve(
-      exportsDirectory,
-      `applications-${exportId}-${randomUUID()}.tmp`,
-    );
+    const temporaryPath = getTemporaryExportPath(exportId, randomUUID());
 
     try {
       const applications = await findApplicationsForExport(
@@ -103,7 +102,7 @@ const worker = new Worker<ExportJobData>(
       // затем публикуем его под окончательным именем.
       await rename(temporaryPath, finalPath);
 
-      await markExportCompleted(exportId, finalPath);
+      await markExportCompleted(exportId, fileKey);
     } catch (error) {
       console.error("Export processing failed:", {
         exportId,

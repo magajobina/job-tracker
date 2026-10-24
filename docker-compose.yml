@@ -1,3 +1,10 @@
+x-backend-image: &backend-image job-tracker-api:day5
+
+x-backend-environment: &backend-environment
+  NODE_ENV: production
+  DATABASE_URL: postgres://app:app@postgres:5432/job_tracker
+  REDIS_URL: redis://redis:6379
+
 services:
   postgres:
     image: postgres:18
@@ -24,6 +31,11 @@ services:
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   adminer:
     image: adminer:latest
@@ -33,6 +45,54 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  api:
+    image: *backend-image
+    build:
+      context: .
+    environment:
+      <<: *backend-environment
+      PORT: "3000"
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in local environment}
+      LAB_ORIGIN: ${LAB_ORIGIN:-http://127.0.0.1:5173}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - type: bind
+        source: ./var/exports
+        target: /app/var/exports
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "node", "dist/src/tools/healthcheck.js"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 45s
+    
+  worker:
+    image: *backend-image
+    command: ["node", "dist/src/workers/export.worker.js"]
+    environment: *backend-environment
+    volumes:
+      - type: bind
+        source: ./var/exports
+        target: /app/var/exports
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 45s
 
 volumes:
   postgres_data:

@@ -5,6 +5,7 @@ import { AppError } from "../errors/app-error.js";
 import type { ExportFormat } from "../entities/export.entity.js";
 import { exportQueue } from "./export.queue.js";
 import { findExportByIdForUser, reserveExport } from "./export.repository.js";
+import { resolveStoredExportPath } from "./export-files.js";
 
 const EXPORT_OPERATION = "applications-export";
 
@@ -95,8 +96,12 @@ export async function getExportFile(exportId: string, userId: string) {
     );
   }
 
+  let filePath: string;
+
   try {
-    const fileInfo = await stat(exportRecord.filePath);
+    filePath = resolveStoredExportPath(exportRecord.id, exportRecord.filePath);
+
+    const fileInfo = await stat(filePath);
 
     if (!fileInfo.isFile()) {
       throw new Error("Путь экспорта не является файлом");
@@ -109,6 +114,6 @@ export async function getExportFile(exportId: string, userId: string) {
 
   return {
     id: exportRecord.id,
-    filePath: exportRecord.filePath,
+    filePath,
   };
 }

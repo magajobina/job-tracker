@@ -51,6 +51,8 @@ const applicationsRepository = AppDataSource.getRepository(Application);
 const app = express();
 const port = Number(process.env.PORT ?? 3000);
 
+let isShuttingDown = false;
+
 const JobBodySchema = z.object({
   title: z.string().trim().min(1),
   company: z.string().trim().min(1),
@@ -71,6 +73,20 @@ const UpdateApplicationSchema = z
     status: z.enum(APPLICATION_STATUSES),
   })
   .strict();
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: NodeJS.Timeout;
+
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`Операция превысила ${timeoutMs} мс`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeout);
+  });
+}
 
 app.use(express.json());
 app.use(sessionMiddleware);
@@ -299,6 +315,36 @@ app.get("/health", async (_req, res) => {
     status: "ok",
     databaseTime: result.rows[0].database_time,
   });
+});
+app.get("/health/live", (_req, res) => {
+  res.status(200).json({
+    status: "ok",
+  });
+});
+app.get("/health/ready", async (_req, res) => {
+  if (isShuttingDown) {
+    res.status(503).json({
+      status: "not_ready",
+    });
+    return;
+  }
+
+  try {
+    await withTimeout(
+      Promise.all([db.query("SELECT 1"), redisClient.ping()]),
+      1500,
+    );
+
+    res.status(200).json({
+      status: "ready",
+    });
+  } catch (error) {
+    console.error("Readiness check failed:", error);
+
+    res.status(503).json({
+      status: "not_ready",
+    });
+  }
 });
 
 app.delete("/jobs/:id", requireAuth, async (req, res) => {
@@ -619,11 +665,9 @@ app.get("/jobs/:id", async (req, res) => {
 
 app.use(errorHandler);
 
-const server = app.listen(port, () => {
-  console.log(`API started on http://localhost:${port}`);
+const server = app.listen(port, "0.0.0.0", () => {
+  console.log(`API started on port ${port}`);
 });
-
-let isShuttingDown = false;
 
 function closeHttpServer() {
   return new Promise<void>((resolve, reject) => {

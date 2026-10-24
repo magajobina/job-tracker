@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: ci_only
+          POSTGRES_DB: job_tracker_lab_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d job_tracker_lab_ci"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://app:ci_only@127.0.0.1:5432/job_tracker_lab_ci
+      REDIS_URL: redis://127.0.0.1:6379
+      SESSION_SECRET: ci-only-session-secret-with-more-than-32-characters
+      LAB_ORIGIN: http://127.0.0.1:5173
+      NODE_ENV: test
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci
+
+      - name: Check backend types
+        run: npm run typecheck
+
+      - name: Compile backend
+        run: npm run build
+
+      - name: Run backend unit tests
+        run: npm test
+
+      - name: Confirm empty migration database
+        run: node dist/src/tools/check-migration-target.js --empty
+
+      - name: Apply complete migration history
+        run: npx typeorm migration:run -d dist/src/data-source.js
+
+      - name: Check migration result
+        run: node dist/src/tools/check-migration-target.js
+
+      - name: Run migration history again
+        run: npx typeorm migration:run -d dist/src/data-source.js
+
+      - name: Run backend feature tests
+        run: npm run test:feature
+
+      - name: Install frontend dependencies
+        run: npm run web:install
+
+      - name: Check frontend types
+        run: npm run web:typecheck
+
+      - name: Build frontend
+        run: npm run web:build
+
+      - name: Build Docker image
+        run: docker build -t job-tracker-api:ci .
+
+      - name: Check runtime Docker image
+        run: >
+          docker run --rm --network none
+          job-tracker-api:ci
+          node dist/src/tools/container-smoke.js
