@@ -13,6 +13,7 @@ type CreateExportInput = {
   userId: string;
   format: ExportFormat;
   idempotencyKey: string;
+  originRequestId?: string;
 };
 
 export async function createExport(input: CreateExportInput) {
@@ -48,6 +49,7 @@ export async function createExport(input: CreateExportInput) {
         "generate-applications-csv",
         {
           exportId: result.exportRecord.id,
+          originRequestId: input.originRequestId,
         },
         {
           jobId: `export-${result.exportRecord.id}`,
@@ -63,6 +65,7 @@ export async function createExport(input: CreateExportInput) {
   return {
     id: result.exportRecord.id,
     status: result.exportRecord.status,
+    created: result.created,
   };
 }
 

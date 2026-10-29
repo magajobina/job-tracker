@@ -3,17 +3,10 @@ import { z } from "zod";
 
 import { createJob } from "./jobs.service.js";
 import { AppError } from "../errors/app-error.js";
-
-const CreateJobSchema = z
-  .object({
-    title: z.string().trim().min(1),
-    company: z.string().trim().min(1),
-    salary: z.number().int().positive().nullish(),
-  })
-  .strict();
+import { JobBodySchema } from "./job.schema.js";
 
 export async function createJobController(req: Request, res: Response) {
-  const result = CreateJobSchema.safeParse(req.body);
+  const result = JobBodySchema.safeParse(req.body);
   const userId = req.session.userId;
 
   if (!result.success) {

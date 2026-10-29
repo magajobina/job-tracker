@@ -7,6 +7,8 @@ import {
   getExportFile,
   getExportStatus,
 } from "./export.service.js";
+import { logger } from "../observability/logger.js";
+import { parsePositiveBigIntId } from "../validation/positive-bigint-id.js";
 
 const CreateExportSchema = z
   .object({
@@ -47,22 +49,41 @@ export async function createExportController(req: Request, res: Response) {
     throw new AppError(401, "Необходима авторизация");
   }
 
+  const originRequestId =
+    typeof res.locals.requestId === "string" ? res.locals.requestId : undefined;
+
   const exportRecord = await createExport({
     userId,
     format: parsedBody.data.format,
     idempotencyKey: parsedIdempotencyKey.data,
+    originRequestId,
   });
 
+  const requestLogger = res.locals.log ?? logger;
+
+  requestLogger.info(
+    {
+      event: "export.accepted",
+      exportId: exportRecord.id,
+      exportStatus: exportRecord.status,
+      reused: !exportRecord.created,
+    },
+    "export accepted",
+  );
+
   res.status(202).json({
-    export: exportRecord,
+    export: {
+      id: exportRecord.id,
+      status: exportRecord.status,
+    },
   });
 }
 
 export async function getExportStatusController(req: Request, res: Response) {
-  const exportId = String(req.params.id);
+  const exportId = parsePositiveBigIntId(req.params.id);
   const userId = req.session.userId;
 
-  if (!/^[1-9]\d*$/.test(exportId)) {
+  if (exportId === null) {
     throw new AppError(400, "Некорректный id экспорта");
   }
 
@@ -71,6 +92,17 @@ export async function getExportStatusController(req: Request, res: Response) {
   }
 
   const exportRecord = await getExportStatus(exportId, userId);
+
+  const requestLogger = res.locals.log ?? logger;
+
+  requestLogger.info(
+    {
+      event: "export.status_read",
+      exportId: exportRecord.id,
+      exportStatus: exportRecord.status,
+    },
+    "export status read",
+  );
 
   res.json({
     export: exportRecord,
@@ -82,10 +114,10 @@ export async function downloadExportController(
   res: Response,
   next: NextFunction,
 ) {
-  const exportId = String(req.params.id);
+  const exportId = parsePositiveBigIntId(req.params.id);
   const userId = req.session.userId;
 
-  if (!/^[1-9]\d*$/.test(exportId)) {
+  if (exportId === null) {
     throw new AppError(400, "Некорректный id экспорта");
   }
 
@@ -105,6 +137,17 @@ export async function downloadExportController(
   res.sendFile(exportFile.filePath, (error) => {
     if (error) {
       next(error);
+      return;
     }
+    
+    const requestLogger = res.locals.log ?? logger;
+
+    requestLogger.info(
+      {
+        event: "export.file_sent",
+        exportId: exportFile.id,
+      },
+      "export file sent",
+    );
   });
 }

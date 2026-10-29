@@ -7,6 +7,7 @@ import { User } from "./entities/user.entity.js";
 import { FindOptionsWhere, ILike, QueryFailedError } from "typeorm";
 import z from "zod";
 import { createJobController } from "./jobs/jobs.controller.js";
+import { JobBodySchema } from "./jobs/job.schema.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { AppError } from "./errors/app-error.js";
 import { sessionMiddleware } from "./middleware/session.js";
@@ -26,6 +27,7 @@ import { requireAuth } from "./middleware/requireAuth.js";
 import {
   Application,
   APPLICATION_STATUSES,
+  type ApplicationStatus,
 } from "./entities/application.entity.js";
 import { loginRateLimiter } from "./middleware/login-rate-limiter.js";
 import {
@@ -41,6 +43,12 @@ import {
 } from "./exports/export.controller.js";
 import { exportQueue } from "./exports/export.queue.js";
 import { requeueInterruptedExports } from "./exports/export.repository.js";
+import { logger } from "./observability/logger.js";
+import { makeRequestLog, markRoute } from "./observability/request-log.js";
+import { createHttpMetrics } from "./observability/http-metrics.js";
+import { createExportMetrics } from "./observability/export-metrics.js";
+import { startMetricsServer } from "./observability/metrics-server.js";
+import { parsePositiveBigIntId } from "./validation/positive-bigint-id.js";
 
 await AppDataSource.initialize();
 await connectRedis();
@@ -53,11 +61,6 @@ const port = Number(process.env.PORT ?? 3000);
 
 let isShuttingDown = false;
 
-const JobBodySchema = z.object({
-  title: z.string().trim().min(1),
-  company: z.string().trim().min(1),
-  salary: z.number().int().positive().nullish(),
-});
 const ApplicationsQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   limit: z.coerce.number().int().positive().max(100).default(10),
@@ -65,7 +68,12 @@ const ApplicationsQuerySchema = z.object({
 });
 const CreateApplicationSchema = z
   .object({
-    jobId: z.string().regex(/^\d+$/, "Некорректный jobId"),
+    jobId: z
+      .string()
+      .refine(
+        (value) => parsePositiveBigIntId(value) !== null,
+        "Некорректный jobId",
+      ),
   })
   .strict();
 const UpdateApplicationSchema = z
@@ -88,10 +96,18 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
-app.use(express.json());
+const { registry, recordHttp } = createHttpMetrics();
+const { refresh: refreshExportMetrics } = createExportMetrics(registry);
+
+app.use(makeRequestLog(logger, recordHttp));
+app.use(
+  express.json({
+    limit: "16kb",
+  }),
+);
 app.use(sessionMiddleware);
 
-app.get("/auth/csrf", (req, res) => {
+app.get("/auth/csrf", markRoute("/auth/csrf"), (req, res) => {
   const csrfToken = generateToken(req);
 
   res.set("Cache-Control", "no-store");
@@ -101,206 +117,260 @@ app.get("/auth/csrf", (req, res) => {
 app.use(originProtection);
 app.use(csrfSynchronisedProtection);
 
-app.post("/auth/register", registerController);
-app.post("/auth/login", loginRateLimiter, loginController);
-app.get("/auth/me", authMeController);
-app.post("/auth/logout", logoutController);
+app.post("/auth/register", markRoute("/auth/register"), registerController);
+app.post(
+  "/auth/login",
+  markRoute("/auth/login"),
+  loginRateLimiter,
+  loginController,
+);
+app.get("/auth/me", markRoute("/auth/me"), authMeController);
+app.post("/auth/logout", markRoute("/auth/logout"), logoutController);
 
-app.post("/exports", requireAuth, createExportController);
-app.get("/exports/:id/file", requireAuth, downloadExportController);
-app.get("/exports/:id", requireAuth, getExportStatusController);
+app.post(
+  "/exports",
+  markRoute("/exports"),
+  requireAuth,
+  createExportController,
+);
+app.get(
+  "/exports/:id/file",
+  markRoute("/exports/:id/file"),
+  requireAuth,
+  downloadExportController,
+);
+app.get(
+  "/exports/:id",
+  markRoute("/exports/:id"),
+  requireAuth,
+  getExportStatusController,
+);
 
-app.get("/applications", requireAuth, async (req, res) => {
-  const parsedQuery = ApplicationsQuerySchema.safeParse(req.query);
+app.get(
+  "/applications",
+  markRoute("/applications"),
+  requireAuth,
+  async (req, res) => {
+    const parsedQuery = ApplicationsQuerySchema.safeParse(req.query);
 
-  if (!parsedQuery.success) {
-    res.status(400).json({
-      success: false,
-      message: "Некорректные параметры запроса",
-      error: z.treeifyError(parsedQuery.error),
-    });
-    return;
-  }
-
-  const userId = req.session.userId;
-
-  if (!userId) {
-    throw new AppError(401, "Необходима авторизация");
-  }
-
-  const { page, limit, status } = parsedQuery.data;
-  const [applications, total] = await applicationsRepository.findAndCount({
-    where: {
-      user: { id: userId },
-      ...(status ? { status } : {}),
-    },
-    relations: {
-      job: true,
-    },
-    take: limit,
-    skip: (page - 1) * limit,
-    order: {
-      createdAt: "DESC",
-      id: "DESC",
-    },
-  });
-
-  const items = applications.map((application) => ({
-    id: application.id,
-    job: {
-      id: application.job.id,
-      title: application.job.title,
-      company: application.job.company,
-    },
-    status: application.status,
-    createdAt: application.createdAt,
-  }));
-
-  res.json({ items, total, page, limit });
-});
-
-app.post("/applications", requireAuth, async (req, res) => {
-  const parsedBody = CreateApplicationSchema.safeParse(req.body);
-
-  if (!parsedBody.success) {
-    res.status(400).json({
-      success: false,
-      message: "Ошибка валидации данных",
-      error: z.treeifyError(parsedBody.error),
-    });
-    return;
-  }
-
-  const userId = req.session.userId;
-
-  if (!userId) {
-    throw new AppError(401, "Необходима авторизация");
-  }
-
-  const job = await jobsRepository.findOneBy({
-    id: parsedBody.data.jobId,
-  });
-
-  if (!job) {
-    throw new AppError(404, "Вакансия не найдена");
-  }
-
-  const application = applicationsRepository.create({
-    user: { id: userId },
-    job,
-    status: "new",
-  });
-
-  try {
-    const savedApplication = await applicationsRepository.save(application);
-
-    res.status(201).json({
-      application: {
-        id: savedApplication.id,
-        job: {
-          id: job.id,
-          title: job.title,
-          company: job.company,
-        },
-        status: savedApplication.status,
-        createdAt: savedApplication.createdAt,
-      },
-    });
-  } catch (error) {
-    const isUniqueViolation =
-      error instanceof QueryFailedError &&
-      (error.driverError as { code?: string }).code === "23505";
-
-    if (isUniqueViolation) {
-      throw new AppError(409, "Вы уже откликнулись на эту вакансию");
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        success: false,
+        message: "Некорректные параметры запроса",
+        error: z.treeifyError(parsedQuery.error),
+      });
+      return;
     }
 
-    throw error;
-  }
-});
+    const userId = req.session.userId;
 
-app.patch("/applications/:id", requireAuth, async (req, res) => {
-  const applicationId = String(req.params.id);
-  const userId = req.session.userId;
+    if (!userId) {
+      throw new AppError(401, "Необходима авторизация");
+    }
 
-  if (!/^\d+$/.test(applicationId)) {
-    throw new AppError(400, "Некорректный id отклика");
-  }
-
-  if (!userId) {
-    throw new AppError(401, "Необходима авторизация");
-  }
-
-  const parsedBody = UpdateApplicationSchema.safeParse(req.body);
-
-  if (!parsedBody.success) {
-    res.status(400).json({
-      success: false,
-      message: "Ошибка валидации данных",
-      error: z.treeifyError(parsedBody.error),
-    });
-    return;
-  }
-
-  const application = await applicationsRepository.findOne({
-    where: {
-      id: applicationId,
-      user: {
-        id: userId,
+    const { page, limit, status } = parsedQuery.data;
+    const [applications, total] = await applicationsRepository.findAndCount({
+      where: {
+        user: { id: userId },
+        ...(status ? { status } : {}),
       },
-    },
-    relations: {
-      job: true,
-    },
-  });
+      relations: {
+        job: true,
+      },
+      take: limit,
+      skip: (page - 1) * limit,
+      order: {
+        createdAt: "DESC",
+        id: "DESC",
+      },
+    });
 
-  if (!application) {
-    throw new AppError(404, "Отклик не найден");
-  }
-
-  application.status = parsedBody.data.status;
-
-  const savedApplication = await applicationsRepository.save(application);
-
-  res.json({
-    application: {
-      id: savedApplication.id,
+    const items = applications.map((application) => ({
+      id: application.id,
       job: {
         id: application.job.id,
         title: application.job.title,
         company: application.job.company,
       },
-      status: savedApplication.status,
-      createdAt: savedApplication.createdAt,
-    },
-  });
-});
+      status: application.status,
+      createdAt: application.createdAt,
+    }));
 
-app.delete("/applications/:id", requireAuth, async (req, res) => {
-  const applicationId = String(req.params.id);
-  const userId = req.session.userId;
+    res.json({ items, total, page, limit });
+  },
+);
 
-  if (!/^\d+$/.test(applicationId)) {
-    throw new AppError(400, "Некорректный id отклика");
-  }
+app.post(
+  "/applications",
+  markRoute("/applications"),
+  requireAuth,
+  async (req, res) => {
+    const parsedBody = CreateApplicationSchema.safeParse(req.body);
 
-  if (!userId) {
-    throw new AppError(401, "Необходима авторизация");
-  }
+    if (!parsedBody.success) {
+      res.status(400).json({
+        success: false,
+        message: "Ошибка валидации данных",
+        error: z.treeifyError(parsedBody.error),
+      });
+      return;
+    }
 
-  const deletedRows = await applicationsRepository.sql<{ id: string }[]>`
+    const userId = req.session.userId;
+
+    if (!userId) {
+      throw new AppError(401, "Необходима авторизация");
+    }
+
+    const job = await jobsRepository.findOneBy({
+      id: parsedBody.data.jobId,
+    });
+
+    if (!job) {
+      throw new AppError(404, "Вакансия не найдена");
+    }
+
+    const application = applicationsRepository.create({
+      user: { id: userId },
+      job,
+      status: "new",
+    });
+
+    try {
+      const savedApplication = await applicationsRepository.save(application);
+
+      res.status(201).json({
+        application: {
+          id: savedApplication.id,
+          job: {
+            id: job.id,
+            title: job.title,
+            company: job.company,
+          },
+          status: savedApplication.status,
+          createdAt: savedApplication.createdAt,
+        },
+      });
+    } catch (error) {
+      const isUniqueViolation =
+        error instanceof QueryFailedError &&
+        (error.driverError as { code?: string }).code === "23505";
+
+      if (isUniqueViolation) {
+        throw new AppError(409, "Вы уже откликнулись на эту вакансию");
+      }
+
+      throw error;
+    }
+  },
+);
+
+app.patch(
+  "/applications/:id",
+  markRoute("/applications/:id"),
+  requireAuth,
+  async (req, res) => {
+    const applicationId = parsePositiveBigIntId(req.params.id);
+    const userId = req.session.userId;
+
+    if (applicationId === null) {
+      throw new AppError(400, "Некорректный id отклика");
+    }
+
+    if (!userId) {
+      throw new AppError(401, "Необходима авторизация");
+    }
+
+    const parsedBody = UpdateApplicationSchema.safeParse(req.body);
+
+    if (!parsedBody.success) {
+      res.status(400).json({
+        success: false,
+        message: "Ошибка валидации данных",
+        error: z.treeifyError(parsedBody.error),
+      });
+      return;
+    }
+
+    const updatedRows = await applicationsRepository.sql<
+      {
+        id: string;
+        status: ApplicationStatus;
+        createdAt: Date;
+        jobId: string;
+        jobTitle: string;
+        jobCompany: string;
+      }[]
+    >`
+      WITH updated_application AS (
+        UPDATE public.applications
+        SET status = ${parsedBody.data.status}
+        WHERE id = ${applicationId}
+          AND user_id = ${userId}
+        RETURNING id, job_id, status, created_at
+      )
+      SELECT
+        updated_application.id,
+        updated_application.status,
+        updated_application.created_at AS "createdAt",
+        jobs.id AS "jobId",
+        jobs.title AS "jobTitle",
+        jobs.company AS "jobCompany"
+      FROM updated_application
+      JOIN public.jobs ON jobs.id = updated_application.job_id
+    `;
+
+    const updatedApplication = updatedRows[0];
+
+    if (!updatedApplication) {
+      throw new AppError(404, "Отклик не найден");
+    }
+
+    res.json({
+      application: {
+        id: updatedApplication.id,
+        job: {
+          id: updatedApplication.jobId,
+          title: updatedApplication.jobTitle,
+          company: updatedApplication.jobCompany,
+        },
+        status: updatedApplication.status,
+        createdAt: updatedApplication.createdAt,
+      },
+    });
+  },
+);
+
+app.delete(
+  "/applications/:id",
+  markRoute("/applications/:id"),
+  requireAuth,
+  async (req, res) => {
+    const applicationId = parsePositiveBigIntId(req.params.id);
+    const userId = req.session.userId;
+
+    if (applicationId === null) {
+      throw new AppError(400, "Некорректный id отклика");
+    }
+
+    if (!userId) {
+      throw new AppError(401, "Необходима авторизация");
+    }
+
+    const deletedRows = await applicationsRepository.sql<{ id: string }[]>`
     DELETE FROM public.applications
     WHERE id = ${applicationId}
       AND user_id = ${userId}
     RETURNING id
   `;
 
-  if (deletedRows.length === 0) {
-    throw new AppError(404, "Отклик не найден");
-  }
+    if (deletedRows.length === 0) {
+      throw new AppError(404, "Отклик не найден");
+    }
 
-  res.status(204).end();
-});
+    res.status(204).end();
+  },
+);
 
 app.get("/test", async (_req, res) => {
   res.json({
@@ -309,19 +379,19 @@ app.get("/test", async (_req, res) => {
   });
 });
 
-app.get("/health", async (_req, res) => {
+app.get("/health", markRoute("/health"), async (_req, res) => {
   const result = await db.query("SELECT now() AS database_time");
   res.json({
     status: "ok",
     databaseTime: result.rows[0].database_time,
   });
 });
-app.get("/health/live", (_req, res) => {
+app.get("/health/live", markRoute("/health/live"), (_req, res) => {
   res.status(200).json({
     status: "ok",
   });
 });
-app.get("/health/ready", async (_req, res) => {
+app.get("/health/ready", markRoute("/health/ready"), async (_req, res) => {
   if (isShuttingDown) {
     res.status(503).json({
       status: "not_ready",
@@ -347,119 +417,121 @@ app.get("/health/ready", async (_req, res) => {
   }
 });
 
-app.delete("/jobs/:id", requireAuth, async (req, res) => {
-  const jobId = String(req.params.id);
-  const userId = req.session.userId;
+app.delete(
+  "/jobs/:id",
+  markRoute("/jobs/:id"),
+  requireAuth,
+  async (req, res) => {
+    const jobId = parsePositiveBigIntId(req.params.id);
+    const userId = req.session.userId;
 
-  if (!/^\d+$/.test(jobId)) {
-    res.status(400).json({
-      success: false,
-      message: "Некорректный id",
-    });
-    return;
-  }
+    if (jobId === null) {
+      throw new AppError(400, "Некорректный id вакансии");
+    }
 
-  if (!userId) {
-    throw new AppError(401, "Необходима авторизация");
-  }
+    if (!userId) {
+      throw new AppError(401, "Необходима авторизация");
+    }
 
-  const deleteResult = await jobsRepository.sql`
+    const deleteResult = await jobsRepository.sql`
     DELETE FROM public.jobs
     WHERE id = ${jobId}
     AND created_by = ${userId}
     RETURNING id
   `;
 
-  if (deleteResult.length === 0) {
-    throw new AppError(404, "Вакансия не найдена");
-  }
+    if (deleteResult.length === 0) {
+      throw new AppError(404, "Вакансия не найдена");
+    }
 
-  await invalidateJobsCache();
+    await invalidateJobsCache();
 
-  res.status(204).end();
-});
+    res.status(204).end();
+  },
+);
 
-app.patch("/jobs/:id", requireAuth, async (req, res) => {
-  const UpdatedJobSchema = JobBodySchema.partial().strict();
-  const jobId = String(req.params.id);
-  const userId = req.session.userId;
+app.patch(
+  "/jobs/:id",
+  markRoute("/jobs/:id"),
+  requireAuth,
+  async (req, res) => {
+    const UpdatedJobSchema = JobBodySchema.partial().strict();
+    const jobId = parsePositiveBigIntId(req.params.id);
+    const userId = req.session.userId;
 
-  if (!/^\d+$/.test(jobId)) {
-    res.status(400).json({
-      success: false,
-      message: "Некорректный id",
-    });
-    return;
-  }
+    if (jobId === null) {
+      throw new AppError(400, "Некорректный id вакансии");
+    }
 
-  if (!userId) {
-    throw new AppError(401, "Необходима авторизация");
-  }
+    if (!userId) {
+      throw new AppError(401, "Необходима авторизация");
+    }
 
-  const oldJob = await jobsRepository.findOne({
-    where: {
-      id: jobId,
-      createdBy: {
-        id: userId,
+    const oldJob = await jobsRepository.findOne({
+      where: {
+        id: jobId,
+        createdBy: {
+          id: userId,
+        },
       },
-    },
-  });
-
-  if (!oldJob) {
-    res.status(404).json({
-      success: false,
-      message: `Job с id ${jobId} не найдена у текущего юзера`,
     });
-    return;
-  }
 
-  const oldJobSnapshot = { ...oldJob };
+    if (!oldJob) {
+      res.status(404).json({
+        success: false,
+        message: `Job с id ${jobId} не найдена у текущего юзера`,
+      });
+      return;
+    }
 
-  const {
-    data: zParsedJob,
-    success,
-    error,
-  } = UpdatedJobSchema.safeParse(req.body);
+    const oldJobSnapshot = { ...oldJob };
 
-  if (!success) {
-    res.status(400).json({
+    const {
+      data: zParsedJob,
       success,
-      message: "Ошибка валидации данных",
-      error: z.treeifyError(error),
+      error,
+    } = UpdatedJobSchema.safeParse(req.body);
+
+    if (!success) {
+      res.status(400).json({
+        success,
+        message: "Ошибка валидации данных",
+        error: z.treeifyError(error),
+      });
+      return;
+    }
+
+    if (Object.keys(zParsedJob).length === 0) {
+      res
+        .status(400)
+        .json({ success: false, message: "Вы передали пустой объект пепе" });
+      return;
+    }
+
+    const mergedJob = jobsRepository.merge(oldJob, zParsedJob);
+
+    const savedJob = await jobsRepository.save(mergedJob);
+
+    await invalidateJobsCache();
+
+    res.status(200).json({
+      job: {
+        id: savedJob.id,
+        title: savedJob.title,
+        company: savedJob.company,
+        salary: savedJob.salary,
+        createdAt: savedJob.createdAt,
+      },
     });
-    return;
-  }
+  },
+);
 
-  if (Object.keys(zParsedJob).length === 0) {
-    res
-      .status(400)
-      .json({ success: false, message: "Вы передали пустой объект пепе" });
-    return;
-  }
-
-  const mergedJob = jobsRepository.merge(oldJob, zParsedJob);
-
-  const savedJob = await jobsRepository.save(mergedJob);
-
-  await invalidateJobsCache();
-
-  res.status(200).json({
-    job: {
-      id: savedJob.id,
-      title: savedJob.title,
-      company: savedJob.company,
-      salary: savedJob.salary,
-      createdAt: savedJob.createdAt,
-    },
-  });
-});
-
-app.post("/jobs", requireAuth, createJobController);
+app.post("/jobs", markRoute("/jobs"), requireAuth, createJobController);
 
 // Клиент отправляет GET /jobs?page=1&limit=10&q=Backend&company=Acme&sort=created_at_desc.
 // q ищет подстроку в названии без учёта регистра; company — точное совпадение.
 // Оба фильтра необязательны. sort допускает только created_at_desc и created_at_asc.
-app.get("/jobs", async (req, res) => {
+app.get("/jobs", markRoute("/jobs"), async (req, res) => {
   const page = Number(req.query.page ?? 1);
   const limit = Number(req.query.limit ?? 10);
   const sort = req.query.sort ?? "created_at_desc";
@@ -655,15 +727,34 @@ app.get("/jobs", async (req, res) => {
 //   res.json(jobs);
 // });
 
-app.get("/jobs/:id", async (req, res) => {
-  const result = await db.query("SELECT * FROM jobs WHERE id = $1", [
-    req.params.id,
-  ]);
+app.get("/jobs/:id", markRoute("/jobs/:id"), async (req, res) => {
+  const jobId = parsePositiveBigIntId(req.params.id);
+
+  if (jobId === null) {
+    throw new AppError(400, "Некорректный id вакансии");
+  }
+
+  const result = await db.query("SELECT * FROM jobs WHERE id = $1", [jobId]);
+
+  if (!result.rows[0]) {
+    throw new AppError(404, "Вакансия не найдена");
+  }
 
   res.json(result.rows[0]);
 });
-
 app.use(errorHandler);
+
+const metricsServer = await startMetricsServer(registry, refreshExportMetrics);
+
+metricsServer.on("error", () => {
+  logger.error(
+    {
+      event: "metrics.server_error",
+      errorCode: "METRICS_SERVER_ERROR",
+    },
+    "metrics server error",
+  );
+});
 
 const server = app.listen(port, "0.0.0.0", () => {
   console.log(`API started on port ${port}`);
@@ -672,6 +763,14 @@ const server = app.listen(port, "0.0.0.0", () => {
 function closeHttpServer() {
   return new Promise<void>((resolve, reject) => {
     server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+function closeMetricsServer() {
+  return new Promise<void>((resolve, reject) => {
+    metricsServer.close((error) => {
       if (error) reject(error);
       else resolve();
     });
@@ -686,6 +785,7 @@ async function shutdown(signal: string) {
 
   try {
     await closeHttpServer();
+    await closeMetricsServer();
 
     await exportQueue.close();
 

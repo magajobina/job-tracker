@@ -20,7 +20,11 @@ import {
   markExportQueuedForRetry,
   requeueInterruptedExports,
 } from "../exports/export.repository.js";
-import { getExportFileLocation, getTemporaryExportPath } from "../exports/export-files.js";
+import {
+  getExportFileLocation,
+  getTemporaryExportPath,
+} from "../exports/export-files.js";
+import { logger } from "../observability/logger.js";
 
 function toCsvCell(value: unknown) {
   let text = String(value ?? "");
@@ -32,6 +36,15 @@ function toCsvCell(value: unknown) {
 
   // В CSV кавычка внутри значения удваивается.
   return `"${text.replaceAll('"', '""')}"`;
+}
+
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function safeRequestId(value: unknown) {
+  return typeof value === "string" && uuidPattern.test(value)
+    ? value
+    : undefined;
 }
 
 function createCsv(
@@ -72,7 +85,35 @@ const worker = new Worker<ExportJobData>(
   async (job) => {
     const exportId = job.data.exportId;
 
+    const originRequestId = safeRequestId(job.data.originRequestId);
+
+    const jobLogger = logger.child({
+      originRequestId,
+      exportId,
+      queueJobId: job.id,
+    });
+
+    jobLogger.info(
+      {
+        event: "export.started",
+        attempt: job.attemptsMade + 1,
+      },
+      "export started",
+    );
+
     const claimedExport = await markExportProcessing(exportId);
+
+    if (!claimedExport) {
+      jobLogger.warn(
+        {
+          event: "export.skipped",
+          reason: "not_queued",
+        },
+        "export skipped",
+      );
+
+      return;
+    }
 
     if (!claimedExport) {
       console.log("export_skipped", {
@@ -103,6 +144,14 @@ const worker = new Worker<ExportJobData>(
       await rename(temporaryPath, finalPath);
 
       await markExportCompleted(exportId, fileKey);
+
+      jobLogger.info(
+        {
+          event: "export.completed",
+          fileKey,
+        },
+        "export completed",
+      );
     } catch (error) {
       console.error("Export processing failed:", {
         exportId,
@@ -114,6 +163,17 @@ const worker = new Worker<ExportJobData>(
       const currentAttempt = job.attemptsMade + 1;
 
       const isFinalAttempt = currentAttempt >= maximumAttempts;
+
+      jobLogger.error(
+        {
+          event: isFinalAttempt ? "export.failed" : "export.retry_scheduled",
+
+          errorCode: "EXPORT_PROCESSING_FAILED",
+          attempt: currentAttempt,
+          maximumAttempts,
+        },
+        "export processing failed",
+      );
 
       if (isFinalAttempt) {
         await markExportFailed(exportId, "Не удалось сформировать CSV");
@@ -134,21 +194,6 @@ const worker = new Worker<ExportJobData>(
     concurrency: 2,
   },
 );
-
-worker.on("completed", (job) => {
-  console.log("export_completed", {
-    jobId: job.id,
-    exportId: job.data.exportId,
-  });
-});
-
-worker.on("failed", (job, error) => {
-  console.error("export_failed", {
-    jobId: job?.id,
-    exportId: job?.data.exportId,
-    message: error.message,
-  });
-});
 
 worker.on("error", (error) => {
   console.error("Export worker error:", error);

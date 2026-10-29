@@ -1,0 +1,59 @@
+groups:
+  - name: job-tracker-learning
+    rules:
+      - alert: JobTrackerSlowSearch
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket{
+                job="job-tracker-api",
+                route="/jobs",
+                method="GET"
+              }[2m])
+            )
+          ) > 1
+          and
+          sum(
+            increase(http_requests_total{
+              job="job-tracker-api",
+              route="/jobs",
+              method="GET"
+            }[2m])
+          ) >= 10
+        for: 15s
+        annotations:
+          summary: "Учебный поиск устойчиво медленный"
+          description: "Проверь график и логи GET /jobs"
+
+      - alert: JobTrackerExportWaiting
+        expr: |
+          exports_oldest_queued_age_seconds{
+            job="job-tracker-api"
+          } > 60
+          and on (job, instance)
+          exports_metrics_collection_success{
+            job="job-tracker-api"
+          } == 1
+        for: 15s
+        annotations:
+          summary: "Экспорт ожидает обработки больше минуты"
+          description: "Проверь worker, Redis и очередь экспортов"
+
+      - alert: JobTrackerExportMeasurementUnavailable
+        expr: |
+          exports_metrics_collection_success{
+            job="job-tracker-api"
+          } == 0
+        for: 15s
+        annotations:
+          summary: "Не удаётся измерить состояние экспортов"
+
+      - alert: JobTrackerMetricsTargetDown
+        expr: |
+          up{
+            job="job-tracker-api"
+          } == 0
+        for: 15s
+        annotations:
+          summary: "Prometheus не получает метрики API"

@@ -29,4 +29,5 @@ export const EXPORT_QUEUE_NAME = "applications-export";
 
 export type ExportJobData = {
   exportId: string;
+  originRequestId?: string;
 };
